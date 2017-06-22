@@ -91,12 +91,13 @@ def record_cmd(argv):
     parser.add_option("--chunksize",           dest="chunksize",     default=768,   type='int',   action="store", help="Advanced. Record to chunks of SIZE KB (Default: %default)", metavar="SIZE")
     parser.add_option("-l", "--limit",         dest="num",           default=0,     type='int',   action="store", help="only record NUM messages on each topic")
     parser.add_option(      "--node",          dest="node",          default=None,  type='string',action="store", help="record all topics subscribed to by a specific node")
+    parser.add_option(      "--publisher",          dest="publisher",          default=None,  type='string',action="store", help="record all topics published by a specific node")
     parser.add_option("-j", "--bz2",           dest="compression",   default=None,  action="store_const", const='bz2', help="use BZ2 compression")
     parser.add_option("--lz4",                 dest="compression",                  action="store_const", const='lz4', help="use LZ4 compression")
 
     (options, args) = parser.parse_args(argv)
 
-    if len(args) == 0 and not options.all and not options.node:
+    if len(args) == 0 and not options.all and not options.node and not options.publisher:
         parser.error("You must specify a topic name or else use the '-a' option.")
 
     if options.prefix is not None and options.name is not None:
@@ -128,6 +129,8 @@ def record_cmd(argv):
     if options.size:        cmd.extend(["--size", str(options.size)])
     if options.node:
         cmd.extend(["--node", options.node])
+    if options.publisher:
+        cmd.extend(["--publisher", options.publisher])
 
     cmd.extend(args)
 
@@ -222,8 +225,6 @@ def play_cmd(argv):
     parser.add_option("--pause-topics", dest="pause_topics", default=[],  callback=handle_pause_topics, action="callback", help="topics to pause on during playback")
     parser.add_option("--bags",  help="bags files to play back from")
     parser.add_option("--wait-for-subscribers",  dest="wait_for_subscribers", default=False, action="store_true", help="wait for at least one subscriber on each topic before publishing")
-    parser.add_option("--rate-control-topic", dest="rate_control_topic", default='', type='str', help="watch the given topic, and if the last publish was more than <rate-control-max-delay> ago, wait until the topic publishes again to continue playback")
-    parser.add_option("--rate-control-max-delay", dest="rate_control_max_delay", default=1.0, type='float', help="maximum time difference from <rate-control-topic> before pausing")
 
     (options, args) = parser.parse_args(argv)
 
@@ -271,12 +272,6 @@ def play_cmd(argv):
     if options.topics or options.pause_topics:
         cmd.extend(['--bags'])
 
-    if options.rate_control_topic:
-        cmd.extend(['--rate-control-topic', str(options.rate_control_topic)])
-
-    if options.rate_control_max_delay:
-        cmd.extend(['--rate-control-max-delay', str(options.rate_control_max_delay)])
-
     cmd.extend(args)
 
     old_handler = signal.signal(
@@ -305,7 +300,8 @@ The following variables are available:
  * t: time of message (t.secs, t.nsecs)""",
                                    description='Filter the contents of the bag.')
     parser.add_option('-p', '--print', action='store', dest='verbose_pattern', default=None, metavar='PRINT-EXPRESSION', help='Python expression to print for verbose debugging. Uses same variables as filter-expression')
-    
+    parser.add_option('--node', action='store', dest='node', default=None, type='string', help='filter for topics published by a node')
+
     options, args = parser.parse_args(argv)
     if len(args) == 0:
         parser.error('You must specify an in bag, an out bag, and an expression.')
@@ -336,6 +332,17 @@ The following variables are available:
         print('ERROR bag unindexed: %s.  Run rosbag reindex.' % inbag_filename, file=sys.stderr)
         return
 
+    if options.node:
+        playpath = roslib.packages.find_node('rosbag', 'filter_node')
+        cmd = [playpath[0]]
+        cmd.extend([inbag_filename, options.node])
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+        process.wait()
+        fitting = set()
+        for line in process.stdout:
+            topic, sec, nsec = line.split(' ')
+            fitting.add((topic, int(sec), int(nsec)))
+
     try:
         meter = ProgressMeter(outbag_filename, inbag._uncompressed_size)
         total_bytes = 0    
@@ -344,35 +351,38 @@ The following variables are available:
             verbose_pattern = expr_eval(options.verbose_pattern)
     
             for topic, raw_msg, t in inbag.read_messages(raw=True):
-                msg_type, serialized_bytes, md5sum, pos, pytype = raw_msg
-                msg = pytype()
-                msg.deserialize(serialized_bytes)
+                if not options.node or (topic, t.secs, t.nsecs) in fitting:
+                    msg_type, serialized_bytes, md5sum, pos, pytype = raw_msg
+                    msg = pytype()
+                    msg.deserialize(serialized_bytes)
 
-                if filter_fn(topic, msg, t):
-                    print('MATCH', verbose_pattern(topic, msg, t))
-                    outbag.write(topic, msg, t)
-                else:
-                    print('NO MATCH', verbose_pattern(topic, msg, t))          
+                    if filter_fn(topic, msg, t):
+                        print('MATCH', verbose_pattern(topic, msg, t))
+                        outbag.write(topic, msg, t)
+                    else:
+                        print('NO MATCH', verbose_pattern(topic, msg, t))          
 
-                total_bytes += len(serialized_bytes) 
-                meter.step(total_bytes)
+                    total_bytes += len(serialized_bytes) 
+                    meter.step(total_bytes)
         else:
             for topic, raw_msg, t in inbag.read_messages(raw=True):
-                msg_type, serialized_bytes, md5sum, pos, pytype = raw_msg
-                msg = pytype()
-                msg.deserialize(serialized_bytes)
+                if not options.node or (topic, t.secs, t.nsecs) in fitting:
+                    msg_type, serialized_bytes, md5sum, pos, pytype = raw_msg
+                    msg = pytype()
+                    msg.deserialize(serialized_bytes)
 
-                if filter_fn(topic, msg, t):
-                    outbag.write(topic, msg, t)
+                    if filter_fn(topic, msg, t):
+                        outbag.write(topic, msg, t)
 
-                total_bytes += len(serialized_bytes)
-                meter.step(total_bytes)
+                    total_bytes += len(serialized_bytes)
+                    meter.step(total_bytes)
         
         meter.finish()
 
     finally:
         inbag.close()
         outbag.close()
+
 def fix_cmd(argv):
     parser = optparse.OptionParser(usage='rosbag fix INBAG OUTBAG [EXTRARULES1 EXTRARULES2 ...]', description='Repair the messages in a bag file so that it can be played in the current system.')
     parser.add_option('-n', '--noplugins', action='store_true', dest='noplugins', help='do not load rulefiles via plugins')
@@ -484,7 +494,7 @@ def check_cmd(argv):
     migrations = checkbag(mm, args[0])
        
     if len(migrations) == 0:
-        print('Bag file does not need any migrations.')
+        print('Bag file is up to date.')
         exit(0)
         
     print('The following migrations need to occur:')
